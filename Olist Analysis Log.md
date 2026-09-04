@@ -10,9 +10,10 @@ Each entry: the business question, the query, the finding, and any caveats.
 | [1](#1-does-delivery-status-affect-customer-review-scores) | Delivery status vs. review scores | Non-delivery, not lateness, drives bad reviews — on-time avg 4.29, late 2.57, stuck/never-delivered 1.28–2.00 |
 | [2](#2-what-does-order-volume-and-revenue-look-like-over-time-any-seasonality-or-sudden-shifts) | Order volume & revenue over time | Steady 2017+ growth, a June 2017 dip, R$15,375,875.44 total revenue |
 | [3](#3-how-does-seller-performance-vary--delivery-adherence-income-reviews-and-product-mix) | Seller performance | Worst seller (`b1b3948...`) combines 0.28 delivery adherence, 1.72 avg review, single-category `auto` specialization |
-| [4](#4-how-does-delivery-time-vary-by-geography-and-does-olists-estimate-account-for-it) | Delivery time by region | Norte takes ~2x longer than Sudeste (22.5 vs. 10.8 days); explained by seller concentration (92.5% of sellers in Sudeste+Sul) and documented road/logistics gaps, not by a higher failure rate |
+| [4](#4-how-does-delivery-time-vary-by-geography-and-does-olists-estimate-account-for-it) | Delivery time by region | Norte takes ~2x longer than Sudeste (22.6 vs. 10.8 days); explained by seller concentration (92.5% of sellers in Sudeste+Sul) and documented road/logistics gaps, not by a higher failure rate |
 | [5](#5-repeat-customer-analysis-how-many-customers-come-back-does-first-purchase-category-predict-it-and-how-long-until-they-return) | Repeat-customer analysis | Only 3.12% of customers ever return; `home_appliances` first-buyers repeat most (9.01%); ~9.21% of "repeat" customers are same-instant split-order artifacts, not real second visits |
 | [6](#6-rfm-segmentation-scoring-customers-on-recency-frequency-and-monetary-value) | RFM segmentation | R/F/M scored separately (not blended) since Frequency is too skewed (96.88% = 1 order) for standard quintiles — used custom tiers instead |
+| [7](#7-does-seller-to-customer-distance-explain-the-regional-delivery-gradient) | Distance vs. delivery time | Per-order seller-to-customer distance (zip-prefix centroids) accounts for the Norte and Nordeste gaps in full: ~0.6 days per 100 km, Norte's residual after distance is 0.7 ± 0.7 days; Sul (+1.5) and Centro-Oeste (+1.1) are slower than their distance predicts |
 
 ---
 
@@ -334,18 +335,21 @@ customer leg, which is where the real geography effect shows up:
 
 | Region | Avg. total delivery | Avg. estimated | Estimate–actual gap | Orders |
 |---|---|---|---|---|
-| Sudeste | 10.8 days | 21.6 days | 11.0 days | 66,187 |
-| Sul | 14.0 days | 26.4 days | 13.5 days | 13,812 |
-| Centro-Oeste | 14.4 days | 26.7 days | 12.4 days | 5,624 |
-| Nordeste | 19.2 days | 30.7 days | 11.4 days | 9,042 |
-| Norte | 22.5 days | 37.5 days | 15.0 days | 1,796 |
+| Sudeste | 10.8 days | 21.6 days | 10.9 days | 66,187 |
+| Sul | 14.0 days | 26.4 days | 12.4 days | 13,812 |
+| Centro-Oeste | 15.0 days | 26.7 days | 11.6 days | 5,624 |
+| Nordeste | 20.0 days | 30.7 days | 10.7 days | 9,042 |
+| Norte | 22.6 days | 37.5 days | 14.9 days | 1,796 |
+
+(Averages are in fractional days; Postgres displays interval averages as `days hh:mm:ss`, and the
+values above were re-read from `EXTRACT(EPOCH ...)/86400` in the statistical-checks notebook.)
 
 Sudeste (São Paulo, Rio de Janeiro, Minas Gerais, Espírito Santo) delivers roughly twice as fast
 as Norte. Olist's estimate consistently overshoots actual delivery time everywhere (Olist pads
-its promise rather than under-delivering), and the size of that buffer scales somewhat with
-regional difficulty — Norte gets the largest safety margin (15.0 days) versus Sudeste's smallest
-(11.0 days) — suggesting the estimation model is at least partially aware of regional risk rather
-than applying one flat national buffer.
+its promise rather than under-delivering). The buffer is 10.7–12.4 days in four regions and
+14.9 days in Norte, so the estimation model treats Norte specifically as higher-risk rather than
+scaling the buffer smoothly with distance; the estimate itself does scale with distance (see the
+distance analysis below).
 
 Cross-check 1 rules out an obvious alternative explanation: order-incompletion rate does **not**
 track region difficulty in the way the delivery-time gradient would predict. Nordeste has the
@@ -660,5 +664,163 @@ lower in the specific revenue definition used here. (4) No single blended RFM sc
 segment labels (e.g. "Champions," "At risk") were assigned this round — scores are left as three
 separate columns; grouping customers into named segments would be a reasonable next step but
 requires a business-judgment mapping not yet defined.
+
+---
+
+## 7. Does seller-to-customer distance explain the regional delivery gradient?
+
+**Question:** The geography analysis attributes Norte's 22.6-day average (vs. Sudeste's 10.8) to
+seller concentration and infrastructure, but measures neither directly — the evidence is seller
+counts by region. If the mechanism is distance, then delivery time should rise with the
+seller-to-customer distance of each order, and region should carry little additional information
+once distance is held constant. If infrastructure matters beyond distance, Norte should remain
+slower than a Sudeste order shipped the same number of kilometres.
+
+**Method:** For every delivered order with all four timestamps populated (the same order set as
+the regional table), the haversine distance between the seller's and the customer's zip-prefix
+centroid was computed from the cleaned `geolocation` table. Orders with more than one seller
+(1,275 of 96,461, 1.3%) were excluded rather than fanned out, so each order has one origin.
+Orders touching a placeholder zip (NULL coordinates) or one of 11 zip prefixes whose averaged
+centroid falls outside Brazil's bounding box were also excluded, leaving 94,708 orders. The
+per-order extract is stored as a view; the SQL below summarises it by distance band and by
+customer region. The regression of delivery time on distance with region dummies (Sudeste as
+reference, HC1 robust errors) is in `stats/statistical_checks.ipynb`.
+
+```sql
+-- Query 1: per-order extract — one row per single-seller, fully-timestamped delivered order
+CREATE OR REPLACE VIEW order_distance AS
+WITH complete_orders AS (
+    SELECT *
+    FROM orders
+    WHERE order_purchase_timestamp IS NOT NULL
+      AND order_approved_at IS NOT NULL
+      AND order_delivered_carrier_date IS NOT NULL
+      AND order_delivered_customer_date IS NOT NULL
+),
+single_seller AS (                      -- one origin per order
+    SELECT order_id, MIN(seller_id) AS seller_id
+    FROM order_items
+    GROUP BY order_id
+    HAVING COUNT(DISTINCT seller_id) = 1
+),
+located AS (
+    SELECT
+        o.order_id,
+        c.customer_state,
+        sr.region                                   AS customer_region,
+        se.seller_state,
+        gc.geolocation_lat  AS c_lat, gc.geolocation_lng AS c_lng,
+        gs.geolocation_lat  AS s_lat, gs.geolocation_lng AS s_lng,
+        EXTRACT(EPOCH FROM (o.order_delivered_customer_date - o.order_purchase_timestamp))   / 86400.0 AS delivery_days,
+        EXTRACT(EPOCH FROM (o.order_delivered_customer_date - o.order_delivered_carrier_date)) / 86400.0 AS carrier_to_customer_days,
+        EXTRACT(EPOCH FROM (o.order_estimated_delivery_date - o.order_purchase_timestamp))   / 86400.0 AS estimated_days
+    FROM complete_orders o
+    JOIN customers     c  ON c.customer_id = o.customer_id
+    JOIN state_region  sr ON sr.state = c.customer_state
+    JOIN single_seller s  ON s.order_id = o.order_id
+    JOIN sellers       se ON se.seller_id = s.seller_id
+    JOIN geolocation   gc ON gc.geolocation_zip_code_prefix = c.customer_zip_code_prefix
+    JOIN geolocation   gs ON gs.geolocation_zip_code_prefix = se.seller_zip_code_prefix
+    WHERE gc.geolocation_lat IS NOT NULL       -- drop the 162 placeholder zips (NULL coordinates)
+      AND gs.geolocation_lat IS NOT NULL
+      -- 11 zip-prefix centroids fall outside Brazil's bounding box (bad source coordinates
+      -- pulled the per-prefix mean off the map); orders touching them are excluded
+      AND gc.geolocation_lat BETWEEN -34 AND 5.5 AND gc.geolocation_lng BETWEEN -74 AND -34.5
+      AND gs.geolocation_lat BETWEEN -34 AND 5.5 AND gs.geolocation_lng BETWEEN -74 AND -34.5
+)
+SELECT
+    order_id,
+    customer_state,
+    customer_region,
+    seller_state,
+    ROUND((2 * 6371 * ASIN(SQRT(
+          POWER(SIN(RADIANS(c_lat - s_lat) / 2), 2)
+        + COS(RADIANS(s_lat)) * COS(RADIANS(c_lat)) * POWER(SIN(RADIANS(c_lng - s_lng) / 2), 2)
+    )))::numeric, 1)                              AS distance_km,
+    ROUND(delivery_days::numeric, 2)              AS delivery_days,
+    ROUND(carrier_to_customer_days::numeric, 2)   AS carrier_to_customer_days,
+    ROUND(estimated_days::numeric, 2)             AS estimated_days
+FROM located;
+
+SELECT COUNT(*) AS n_orders, MIN(distance_km), MAX(distance_km) FROM order_distance;
+
+
+-- Query 2: delivery time by distance band
+SELECT
+    CASE
+        WHEN distance_km <  100  THEN '0. < 100 km'
+        WHEN distance_km <  500  THEN '1. 100-500 km'
+        WHEN distance_km < 1000  THEN '2. 500-1,000 km'
+        WHEN distance_km < 2000  THEN '3. 1,000-2,000 km'
+        ELSE                          '4. >= 2,000 km'
+    END                                          AS distance_band,
+    COUNT(*)                                     AS n_orders,
+    ROUND(AVG(delivery_days), 1)                 AS avg_delivery_days,
+    ROUND(AVG(carrier_to_customer_days), 1)      AS avg_carrier_to_customer_days,
+    ROUND(AVG(estimated_days), 1)                AS avg_estimated_days,
+    ROUND(100.0 * AVG(CASE WHEN delivery_days > estimated_days THEN 1 ELSE 0 END), 2) AS late_pct
+FROM order_distance
+GROUP BY 1
+ORDER BY 1;
+
+
+-- Query 3: average seller-to-customer distance by customer region
+--          (to set against the region delivery-time table in the geography analysis)
+SELECT
+    customer_region,
+    COUNT(*)                                     AS n_orders,
+    ROUND(AVG(distance_km), 0)                   AS avg_distance_km,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY distance_km)::numeric, 0) AS median_distance_km,
+    ROUND(AVG(delivery_days), 1)                 AS avg_delivery_days,
+    ROUND(100.0 * AVG(CASE WHEN seller_state = customer_state THEN 1 ELSE 0 END), 1) AS same_state_pct
+FROM order_distance
+GROUP BY 1
+ORDER BY 3;
+```
+
+**Finding:** Delivery time rises roughly linearly with distance, about 0.6 days per 100 km on a
+base of about 8.6 days at zero distance (approval, dispatch and last-mile handling that do not
+scale with distance). Late-delivery rate doubles across the bands.
+
+| Distance band | Orders | Avg. delivery | Carrier→customer | Avg. estimated | Late |
+|---|---|---|---|---|---|
+| < 100 km | 17,693 | 6.5 days | 3.4 days | 15.3 days | 6.44% |
+| 100–500 km | 36,454 | 11.6 days | 8.4 days | 22.9 days | 7.24% |
+| 500–1,000 km | 25,378 | 14.4 days | 11.1 days | 26.3 days | 8.52% |
+| 1,000–2,000 km | 9,619 | 18.0 days | 14.7 days | 30.1 days | 10.88% |
+| ≥ 2,000 km | 5,564 | 21.2 days | 17.8 days | 33.2 days | 13.75% |
+
+The regional ordering of delivery time is the regional ordering of distance. Half of Sudeste's
+orders are fulfilled in-state; none of Norte's are.
+
+| Customer region | Orders | Median distance | Avg. delivery | Same-state seller |
+|---|---|---|---|---|
+| Sudeste | 65,090 | 330 km | 10.8 days | 50.3% |
+| Sul | 13,575 | 625 km | 14.1 days | 9.1% |
+| Centro-Oeste | 5,365 | 864 km | 15.1 days | 1.5% |
+| Nordeste | 8,914 | 1,884 km | 20.0 days | 1.5% |
+| Norte | 1,764 | 2,378 km | 22.6 days | 0.0% |
+
+Regressing delivery days on distance and region together (notebook §4): region alone explains
+10.9% of order-level variance, distance alone 15.5%, both 15.8%. Holding distance constant,
+Norte's gap to Sudeste falls from 11.9 days to 0.7 (95% CI −0.02 to 1.34) and Nordeste's from
+9.3 to 0.8 — distance accounts for both. Sul (+1.5 days, CI 1.4–1.7) and Centro-Oeste (+1.1,
+CI 0.9–1.4) are the regions that remain slower than their distance predicts. A median regression
+gives the same picture (Norte −0.05, Nordeste +0.08, Centro-Oeste +1.4, Sul +1.6 days). The
+infrastructure explanation is therefore not needed to account for Norte's average; Norte is slow
+because its orders travel ~2,200 km from Sudeste and Sul sellers at the same per-kilometre rate
+as everyone else's. Olist's estimate tracks distance more closely (Spearman 0.62) than actual
+delivery time does (0.54), so the estimation model is distance-aware.
+
+**Caveat:** (1) Distances are between zip-prefix centroids (mean coordinate per prefix after the
+cleaning in `main.ipynb`), not addresses; within-city distances are noisy near zero, and one
+implausible pair (ES→SP, 3,927 km) survives the bounding-box filter without affecting the
+estimates. (2) Haversine is straight-line distance. Road or river routing lengthens it unevenly by
+region, so any infrastructure effect is folded into the per-kilometre rate rather than appearing
+as a regional residual; the finding is that no residual exists for Norte beyond that, not that
+infrastructure is irrelevant. (3) Excluding multi-seller orders removes 1.3% of orders that are,
+by construction, more complex to fulfil; their delivery times are not represented. (4) R² of 0.16
+means geography explains where the regional averages sit, not why an individual order is late —
+84% of order-level variance is seller-, carrier- and order-specific.
 
 ---
