@@ -13,7 +13,7 @@ Date:     2026-09-04
 */
 
 
--- per-order extract — one row per single-seller, fully-timestamped delivered order
+-- Query 1 per-order extract — one row per single-seller, fully-timestamped delivered order
 CREATE OR REPLACE VIEW order_distance AS
 WITH complete_orders AS (
     SELECT *
@@ -71,7 +71,7 @@ FROM located;
 SELECT COUNT(*) AS n_orders, MIN(distance_km), MAX(distance_km) FROM order_distance;
 
 
--- delivery time by distance band
+-- Query 2 delivery time by distance band
 SELECT
     CASE
         WHEN distance_km <  100  THEN '0. < 100 km'
@@ -90,7 +90,7 @@ GROUP BY 1
 ORDER BY 1;
 
 
--- average seller-to-customer distance by customer region
+-- Query 3 average seller-to-customer distance by customer region
 --          (to set against the region delivery-time table in the geography analysis)
 SELECT
     customer_region,
